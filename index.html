@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>JEPA Embedding Explorer</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+
+    <header class="hud hud-top-left">
+      <div class="brand">
+        <span class="brand-title">JEPA Explorer</span>
+        <span class="brand-meta" id="meta"></span>
+      </div>
+      <div class="toolbar">
+        <div class="search">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="search" type="search" placeholder="Filter by file or category" autocomplete="off" spellcheck="false" />
+          <span class="search-count" id="search-count"></span>
+        </div>
+        <div class="segmented" id="layout-toggle" role="group" aria-label="Layout">
+          <button data-layout="pca" class="active">PCA</button>
+          <button data-layout="umap" disabled>UMAP</button>
+          <button data-layout="patch" disabled>Patches</button>
+        </div>
+        <button class="btn icon" id="btn-grid" title="Toggle grid (G)" aria-pressed="true">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>
+        </button>
+        <button class="btn icon" id="btn-fly" title="Fly mode (F)" aria-pressed="false">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 20l8-4 8 4z"/></svg>
+        </button>
+        <button class="btn" id="btn-reset" title="Reset view (R)">Reset</button>
+      </div>
+    </header>
+
+    <div class="hud hud-bottom-left" id="legend" hidden></div>
+
+    <div class="hud hud-bottom-right">
+      <div class="stats" id="stats"></div>
+      <div class="help" id="help">
+        <button class="btn icon help-toggle" id="help-toggle" title="Controls" aria-expanded="false">?</button>
+        <div class="help-body">
+          <div class="help-title">Controls</div>
+          <dl>
+            <dt>Orbit</dt><dd>Left drag</dd>
+            <dt>Pan</dt><dd>Right drag · Shift + drag</dd>
+            <dt>Zoom</dt><dd>Scroll · Pinch</dd>
+            <dt>Fly</dt><dd>W A S D · Q E · Shift = fast</dd>
+            <dt>Look</dt><dd>Drag in fly mode</dd>
+            <dt>Focus</dt><dd>Click an image</dd>
+            <dt>Compare</dt><dd>Shift + click a second image</dd>
+            <dt>Patches</dt><dd>P · every image as its patch tokens</dd>
+            <dt>Reset</dt><dd>R</dd>
+            <dt>Fly mode</dt><dd>F</dd>
+            <dt>Grid</dt><dd>G</dd>
+            <dt>Deselect</dt><dd>Esc</dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+
+    <aside class="panel" id="panel" hidden>
+      <button class="btn icon panel-close" id="panel-close" title="Close (Esc)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+      <div class="panel-image"><img id="panel-img" alt="" /><div class="patch-box" id="patch-box" hidden></div></div>
+      <div class="panel-head">
+        <div class="panel-file" id="panel-file"></div>
+        <div class="panel-cat" id="panel-cat"></div>
+      </div>
+      <div class="panel-hint" id="patch-hint" hidden></div>
+      <div class="compare" id="compare" hidden>
+        <div class="compare-pair">
+          <span class="compare-thumb"><img id="compare-a" alt="" /></span>
+          <span class="compare-arrow">↔</span>
+          <span class="compare-thumb"><img id="compare-b" alt="" /><div class="patch-box" id="patch-box-b" hidden></div></span>
+        </div>
+        <div class="compare-value"><span id="compare-sim"></span><span class="compare-label">cosine similarity</span></div>
+        <div class="compare-patches" id="compare-patches" hidden>
+          <span id="compare-patch-sim"></span><span class="compare-label" id="compare-patch-label">mean best-match patch similarity</span>
+        </div>
+        <div class="compare-file" id="compare-file"></div>
+      </div>
+      <div class="panel-section-title">Nearest neighbors <span class="muted">cosine similarity</span></div>
+      <ol class="neighbors" id="neighbors"></ol>
+      <div class="panel-note">The 3D layout is a projection. Similarity scores are the ground truth.</div>
+    </aside>
+
+    <div class="tooltip" id="tooltip" hidden>
+      <img id="tooltip-img" alt="" />
+      <div class="tooltip-text">
+        <div class="tooltip-file" id="tooltip-file"></div>
+        <div class="tooltip-cat" id="tooltip-cat"></div>
+        <div class="tooltip-sub" id="tooltip-sub"></div>
+      </div>
+    </div>
+
+    <div class="loading" id="loading"><div class="loading-bar"><div class="loading-fill" id="loading-fill"></div></div><div class="loading-text" id="loading-text">Loading</div></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
