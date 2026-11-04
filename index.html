@@ -15,6 +15,9 @@
         <span class="brand-meta" id="meta"></span>
       </div>
       <div class="toolbar">
+        <button class="btn icon" id="btn-layers" title="Show or hide images (L)" aria-pressed="true">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg>
+        </button>
         <div class="search">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
           <input id="search" type="search" placeholder="Filter by file or category" autocomplete="off" spellcheck="false" />
@@ -25,17 +28,46 @@
           <button data-layout="umap" disabled>UMAP</button>
           <button data-layout="patch" disabled>Patches</button>
         </div>
-        <button class="btn icon" id="btn-grid" title="Toggle grid (G)" aria-pressed="true">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>
-        </button>
         <button class="btn icon" id="btn-fly" title="Fly mode (F)" aria-pressed="false">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 20l8-4 8 4z"/></svg>
         </button>
         <button class="btn" id="btn-reset" title="Reset view (R)">Reset</button>
+        <button class="btn" id="btn-add" title="Add your own images (or drop files anywhere)" aria-expanded="false">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          Add images
+        </button>
+      </div>
+      <div class="hud-stack">
+      <div class="upload" id="upload" hidden>
+        <div class="upload-drop">
+          <div class="upload-drop-title">Drop images anywhere on the page</div>
+          <div class="upload-drop-sub">or</div>
+          <button class="btn" id="upload-choose">Choose files</button>
+          <input id="upload-files" type="file" accept="image/jpeg,image/png,image/webp" multiple hidden />
+        </div>
+        <label class="upload-field"><span>Category</span><input id="upload-category" type="text" placeholder="optional, e.g. dogs" autocomplete="off" spellcheck="false" /></label>
+        <div class="upload-status" id="upload-status"></div>
+      </div>
+      <aside class="drawer" id="drawer" aria-label="Images">
+        <div class="drawer-head">
+          <span class="drawer-title">Images</span>
+          <span class="drawer-count" id="drawer-count"></span>
+          <span class="drawer-actions">
+            <button class="link" id="show-all" title="Show every image">All</button>
+            <button class="link" id="hide-all" title="Hide every image">None</button>
+          </span>
+        </div>
+        <div class="drawer-list" id="drawer-list"></div>
+        <div class="drawer-foot">
+          <div class="drawer-section-title">Display</div>
+          <label class="switch"><span>Grid</span><input type="checkbox" id="opt-grid" checked /><i></i></label>
+          <label class="switch"><span>Neighbor lines</span><input type="checkbox" id="opt-lines" checked /><i></i></label>
+          <label class="switch"><span>Thumbnails</span><input type="checkbox" id="opt-thumbs" checked /><i></i></label>
+        </div>
+      </aside>
       </div>
     </header>
-
-    <div class="hud hud-bottom-left" id="legend" hidden></div>
+    <div class="drop-overlay" id="drop-overlay" hidden><div class="drop-overlay-box">Drop to embed</div></div>
 
     <div class="hud hud-bottom-right">
       <div class="stats" id="stats"></div>
@@ -52,6 +84,7 @@
             <dt>Focus</dt><dd>Click an image</dd>
             <dt>Compare</dt><dd>Shift + click a second image</dd>
             <dt>Patches</dt><dd>P · every image as its patch tokens</dd>
+            <dt>Images</dt><dd>L · show or hide images</dd>
             <dt>Reset</dt><dd>R</dd>
             <dt>Fly mode</dt><dd>F</dd>
             <dt>Grid</dt><dd>G</dd>

@@ -4,13 +4,14 @@ Run a folder of images through a frozen, pretrained [I-JEPA](https://huggingface
 
 ```
 embed.py                 # images -> embeddings, PCA/UMAP layouts, thumbnails, points.json
+serve.py                 # local server that embeds images you drop into the viewer
 scripts/synthetic.py     # fake data set for trying the viewer without a model
 scripts/make_test_images.py
 src/
   main.ts                # scene, data loading, selection state, render loop
   controls.ts            # orbit / pan / zoom-to-cursor / fly / animated focus
   points.ts              # instanced sprites, texture atlas, LOD, picking
-  ui.ts                  # tooltip, side panel, search, legend, help
+  ui.ts                  # tooltip, side panel, search, images drawer, help
 public/data/             # generated output (git-ignored)
 ```
 
@@ -63,6 +64,7 @@ Output in `public/data/`:
 - `similarity.bin`: float32 `N x N` cosine matrix, written when `N <= --sim-max`.
 - `patches.bin`: float32 `(N, 256, 3)`, every patch token of every image projected into one shared 3D PCA space. The image's position in this space (`layouts.patch`) is the centroid of its own patches, because PCA is linear.
 - `patch_feats.bin`: float32 `(N, 256, 16)`, the same tokens in 16 PCA dimensions, used in the browser to match patches between two images.
+- `models.pkl`: the fitted PCA and UMAP projections, so `serve.py` can place new images into the same layouts.
 
 ## 2. Explore
 
@@ -85,6 +87,7 @@ Open the printed URL. The viewer reads `public/data/points.json` on load.
 | focus an image | click it (the camera flies there in 600 ms and orbits around it from then on) |
 | reset to overview | `R` or the Reset button |
 | grid on/off | `G` |
+| images drawer | `L` |
 | deselect | `Esc` |
 | filter | `/` focuses the search box |
 
@@ -95,7 +98,8 @@ There is no minimum zoom distance, so you can move inside a dense cluster, and t
 - **Hover** shows the thumbnail, file name and category.
 - **Click** opens the side panel with the image, its category and its 10 nearest neighbors ranked by cosine similarity. Lines connect the selected image to its neighbors and everything else dims. Click a neighbor to fly to it.
 - **Shift + click** a second image to see the exact cosine similarity between the two, with a line connecting them. When `similarity.bin` was written the value comes from the full matrix; otherwise it is taken from the stored neighbor lists and shown as n/a for pairs outside them.
-- **Search** filters by file name or category. Non-matching points dim but stay in place. Click a category in the legend to isolate it (click several to combine).
+- **Search** filters by file name or category. Non-matching points dim but stay in place.
+- **Images drawer** (left side, `L` or the layers button) removes images from the scene and brings them back. Each category row is a checkbox; `only` shows that category alone (click again to restore everything); the chevron opens a thumbnail grid where single images can be switched off (double-click one to focus it). Hidden images are not drawn, picked or linked, and a hidden neighbor is marked in the side panel. `All` / `None` act on the whole set. The Display section toggles the grid, neighbor lines and thumbnails.
 - **PCA / UMAP / Patches** switches layouts with a 1 s animated transition. `P` toggles the Patches view.
 
 ### Patches view
@@ -112,7 +116,24 @@ At 5,000 images this is 1.28 million points in one draw call, which still holds 
 
 The viewer reads `public/data/` by default. Add `?data=<folder>` to the URL to read another folder under `public/`, for example `?data=synthetic`.
 
-## 3. Try it without a model
+## 3. Add your own images while the viewer is open
+
+Start the embedding server in a second terminal. It loads the encoder once and keeps it in memory.
+
+```bash
+python serve.py --data ./public/data
+```
+
+Then click **Add images** in the viewer, or drop image files anywhere on the page. Each image is embedded (well under a second on a GPU or Apple Silicon), projected into the existing PCA, UMAP and patch layouts with the projections saved by `embed.py`, and added to the scene in place: it fades in, the camera flies to it, and its nearest neighbors appear in the panel. Give the batch a category in the popover to color the new points; otherwise they are gray.
+
+Uploads are permanent. The server writes the thumbnail, a preview copy, the embedding, the patch tokens and the updated `points.json` into the data folder, and refreshes `similarity.bin`, so the images are still there after a reload. Existing images' neighbor lists are updated when a new image is closer than their old neighbors.
+
+Two things to know:
+
+- The layouts are fixed when `embed.py` runs. New images are projected into them, which is exact for PCA and patch space and approximate for UMAP, but the layouts are not refitted. After adding many images, re-run `embed.py` on the full folder (the uploaded files are in `public/data/images/`) to get fresh layouts.
+- The Vite dev server proxies `/api` to `127.0.0.1:8765` (see `vite.config.ts`). If the server is not running, the popover says so.
+
+## 4. Try it without a model
 
 ```bash
 python scripts/synthetic.py --n 5000 --out ./public/synthetic

@@ -14,6 +14,7 @@ const vertexShader = /* glsl */ `
   attribute float aAlpha;
   attribute float aHighlight;
   attribute float aIndex;
+  attribute float aHidden;
 
   uniform float uMix;
   uniform float uThumbSize;
@@ -34,6 +35,11 @@ const vertexShader = /* glsl */ `
   varying float vPx;
 
   void main() {
+    // hidden images fade out through aAlpha, then collapse off screen so they cost nothing
+    if (aHidden > 0.5 && aAlpha < 0.02) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
     vec3 center = mix(aPos0, aPos1, uMix);
     vec4 mv = modelViewMatrix * vec4(center, 1.0);
     float dist = max(1e-4, -mv.z);
@@ -133,7 +139,10 @@ export interface PointCloudOptions {
 
 export class PointCloud {
   readonly mesh: THREE.Mesh;
-  readonly count: number;
+  /** Number of live points. */
+  count: number;
+  /** Slots allocated up front so images can be appended without rebuilding. */
+  readonly capacity: number;
   readonly material: THREE.ShaderMaterial;
   /** Interpolated positions in world space, kept in sync with the shader. */
   readonly positions: Float32Array;
@@ -144,6 +153,10 @@ export class PointCloud {
   private readonly pos1: THREE.InstancedBufferAttribute;
   private readonly alphaAttr: THREE.InstancedBufferAttribute;
   private readonly highlightAttr: THREE.InstancedBufferAttribute;
+  private readonly colorAttr: THREE.InstancedBufferAttribute;
+  private readonly hiddenAttr: THREE.InstancedBufferAttribute;
+  /** 1 for images removed from the scene (not drawn, not pickable). */
+  readonly hidden: Uint8Array;
   readonly alphaTarget: Float32Array;
   private alphaSettled = true;
   private layoutAnim: { start: number; duration: number } | null = null;
@@ -165,18 +178,19 @@ export class PointCloud {
   constructor(renderer: THREE.WebGLRenderer, data: PointsData, categories: Map<string, Category>, opts: PointCloudOptions) {
     this.renderer = renderer;
     const n = (this.count = data.items.length);
+    const cap = (this.capacity = n + Math.max(256, n));
     this.thumbSize = opts.thumbSize;
     const layoutNames = Object.keys(data.layouts);
     this.currentLayout = layoutNames.includes('pca') ? 'pca' : layoutNames[0];
 
     // --- atlas sizing: biggest cell that fits every thumbnail into one texture
     const maxTex = Math.min(renderer.capabilities.maxTextureSize, 8192);
-    const cols = Math.ceil(Math.sqrt(n));
+    const cols = Math.ceil(Math.sqrt(cap));
     let cell = 128;
     while (cell > 16 && cols * cell > maxTex) cell /= 2;
     this.cell = cell;
     this.cols = cols;
-    const rows = Math.ceil(n / cols);
+    const rows = Math.ceil(cap / cols);
     const atlas = new THREE.DataTexture(null, cols * cell, rows * cell, THREE.RGBAFormat, THREE.UnsignedByteType);
     atlas.colorSpace = THREE.SRGBColorSpace;
     atlas.minFilter = THREE.LinearFilter;
@@ -196,7 +210,7 @@ export class PointCloud {
     geometry.instanceCount = n;
 
     const flat = (name: string) => {
-      const arr = new Float32Array(n * 3);
+      const arr = new Float32Array(cap * 3);
       const src = data.layouts[name];
       for (let i = 0; i < n; i++) {
         arr[i * 3] = src[i][0];
@@ -209,30 +223,37 @@ export class PointCloud {
     this.layoutTo = this.layoutFrom;
     this.positions = new Float32Array(this.layoutFrom);
 
-    const colors = new Float32Array(n * 3);
-    const index = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
+    const colors = new Float32Array(cap * 3);
+    const index = new Float32Array(cap);
+    for (let i = 0; i < cap; i++) {
+      index[i] = i;
+      if (i >= n) continue;
       const c = categories.get(data.items[i].category ?? '')!.color;
       colors[i * 3] = c.r;
       colors[i * 3 + 1] = c.g;
       colors[i * 3 + 2] = c.b;
-      index[i] = i;
     }
-    this.alphaTarget = new Float32Array(n).fill(1);
+    this.alphaTarget = new Float32Array(cap).fill(1);
+    this.hidden = new Uint8Array(cap);
 
     this.pos0 = new THREE.InstancedBufferAttribute(new Float32Array(this.layoutFrom), 3);
     this.pos1 = new THREE.InstancedBufferAttribute(new Float32Array(this.layoutFrom), 3);
-    this.alphaAttr = new THREE.InstancedBufferAttribute(new Float32Array(n).fill(1), 1);
-    this.highlightAttr = new THREE.InstancedBufferAttribute(new Float32Array(n), 1);
+    this.alphaAttr = new THREE.InstancedBufferAttribute(new Float32Array(cap).fill(1), 1);
+    this.highlightAttr = new THREE.InstancedBufferAttribute(new Float32Array(cap), 1);
+    this.hiddenAttr = new THREE.InstancedBufferAttribute(new Float32Array(cap), 1);
+    this.hiddenAttr.setUsage(THREE.DynamicDrawUsage);
+    this.colorAttr = new THREE.InstancedBufferAttribute(colors, 3);
+    this.colorAttr.setUsage(THREE.DynamicDrawUsage);
     this.pos0.setUsage(THREE.DynamicDrawUsage);
     this.pos1.setUsage(THREE.DynamicDrawUsage);
     this.alphaAttr.setUsage(THREE.DynamicDrawUsage);
     this.highlightAttr.setUsage(THREE.DynamicDrawUsage);
     geometry.setAttribute('aPos0', this.pos0);
     geometry.setAttribute('aPos1', this.pos1);
-    geometry.setAttribute('aColor', new THREE.InstancedBufferAttribute(colors, 3));
+    geometry.setAttribute('aColor', this.colorAttr);
     geometry.setAttribute('aAlpha', this.alphaAttr);
     geometry.setAttribute('aHighlight', this.highlightAttr);
+    geometry.setAttribute('aHidden', this.hiddenAttr);
     geometry.setAttribute('aIndex', new THREE.InstancedBufferAttribute(index, 1));
     this.geometry = geometry;
 
@@ -275,7 +296,7 @@ export class PointCloud {
     this.currentLayout = name;
     this.layoutFrom = new Float32Array(this.positions);
     const src = data.layouts[name];
-    const to = new Float32Array(this.count * 3);
+    const to = new Float32Array(this.capacity * 3);
     for (let i = 0; i < this.count; i++) {
       to[i * 3] = src[i][0];
       to[i * 3 + 1] = src[i][1];
@@ -305,6 +326,21 @@ export class PointCloud {
   clearHighlights(): void {
     (this.highlightAttr.array as Float32Array).fill(0);
     this.highlightAttr.needsUpdate = true;
+  }
+
+  /** Remove an image from the scene (it fades out) or bring it back (it fades in). */
+  setHidden(id: number, on: boolean): void {
+    const v = on ? 1 : 0;
+    if (this.hidden[id] === v) return;
+    this.hidden[id] = v;
+    (this.hiddenAttr.array as Float32Array)[id] = v;
+    this.hiddenAttr.needsUpdate = true;
+  }
+
+  /** Dots only (false) or thumbnails up close (true). */
+  setThumbnails(on: boolean): void {
+    this.material.uniforms.uLodLo.value = on ? 9 : 1e9;
+    this.material.uniforms.uLodHi.value = on ? 22 : 2e9;
   }
 
   /** Call after editing `alphaTarget`. */
@@ -368,6 +404,7 @@ export class PointCloud {
     let best = -1;
     let bestDepth = Infinity;
     for (let i = 0; i < this.count; i++) {
+      if (this.hidden[i]) continue;
       const x = p[i * 3], y = p[i * 3 + 1], z = p[i * 3 + 2];
       v.set(
         e[0] * x + e[4] * y + e[8] * z + e[12],
@@ -391,33 +428,67 @@ export class PointCloud {
     return best;
   }
 
+  /**
+   * Add one image in a free slot. Returns false when the cloud is full.
+   * The point fades in at its position in the current layout.
+   */
+  append(id: number, positions: Record<string, number[]>, currentLayout: string, color: THREE.Color, thumbUrl: string): boolean {
+    if (id !== this.count || id >= this.capacity) return false;
+    const p = positions[currentLayout] ?? positions[Object.keys(positions)[0]] ?? [0, 0, 0];
+    const o = id * 3;
+    for (const arr of [this.positions, this.layoutFrom, this.layoutTo, this.pos0.array as Float32Array, this.pos1.array as Float32Array]) {
+      arr[o] = p[0];
+      arr[o + 1] = p[1];
+      arr[o + 2] = p[2];
+    }
+    const c = this.colorAttr.array as Float32Array;
+    c[o] = color.r;
+    c[o + 1] = color.g;
+    c[o + 2] = color.b;
+    (this.alphaAttr.array as Float32Array)[id] = 0;
+    this.alphaTarget[id] = 1;
+    (this.highlightAttr.array as Float32Array)[id] = 0;
+    this.hidden[id] = 0;
+    (this.hiddenAttr.array as Float32Array)[id] = 0;
+    this.pos0.needsUpdate = this.pos1.needsUpdate = this.colorAttr.needsUpdate = true;
+    this.alphaAttr.needsUpdate = this.highlightAttr.needsUpdate = this.hiddenAttr.needsUpdate = true;
+    this.alphaSettled = false;
+    this.count = id + 1;
+    this.geometry.instanceCount = this.count;
+    void this.loadThumbnail(id, thumbUrl);
+    return true;
+  }
+
+  /** Fetch one thumbnail and copy it into its atlas cell. */
+  async loadThumbnail(i: number, url: string): Promise<void> {
+    const cell = this.cell;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(String(res.status));
+      const blob = await res.blob();
+      const bmp = await createImageBitmap(blob, { resizeWidth: cell, resizeHeight: cell, resizeQuality: 'high' });
+      if (this.aborted) {
+        bmp.close();
+        return;
+      }
+      const src = new THREE.Texture(bmp);
+      src.flipY = false;
+      src.colorSpace = THREE.SRGBColorSpace;
+      this.renderer.copyTextureToTexture(src, this.atlas, null, new THREE.Vector2((i % this.cols) * cell, Math.floor(i / this.cols) * cell));
+      bmp.close();
+    } catch {
+      /* leave the cell empty; the sprite still renders as a dot */
+    }
+  }
+
   /** Stream thumbnails into the atlas. Resolves when all are done. */
   async loadThumbnails(urls: string[], onProgress?: (done: number, total: number) => void): Promise<void> {
     const total = urls.length;
     let next = 0;
-    const cell = this.cell;
-    const pos = new THREE.Vector2();
     const worker = async () => {
       while (next < total && !this.aborted) {
         const i = next++;
-        try {
-          const res = await fetch(urls[i]);
-          if (!res.ok) throw new Error(String(res.status));
-          const blob = await res.blob();
-          const bmp = await createImageBitmap(blob, { resizeWidth: cell, resizeHeight: cell, resizeQuality: 'high' });
-          if (this.aborted) {
-            bmp.close();
-            return;
-          }
-          const src = new THREE.Texture(bmp);
-          src.flipY = false;
-          src.colorSpace = THREE.SRGBColorSpace;
-          pos.set((i % this.cols) * cell, Math.floor(i / this.cols) * cell);
-          this.renderer.copyTextureToTexture(src, this.atlas, null, pos);
-          bmp.close();
-        } catch {
-          /* leave the cell empty; the sprite still renders as a dot */
-        }
+        await this.loadThumbnail(i, urls[i]);
         this.loaded++;
         onProgress?.(this.loaded, total);
       }

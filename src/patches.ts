@@ -11,6 +11,7 @@ import type { Category, PointsData } from './data';
 const vertexShader = /* glsl */ `
   attribute vec3 aColor;
   attribute float aSlot;
+  attribute float aHidden;
 
   uniform float uOpacity;
   uniform float uGrow;
@@ -27,6 +28,11 @@ const vertexShader = /* glsl */ `
   varying float vDist;
 
   void main() {
+    if (aHidden > 0.5) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      gl_PointSize = 0.0;
+      return;
+    }
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     float dist = max(1e-4, -mv.z);
     float hi = step(0.5, aSlot);
@@ -86,10 +92,16 @@ export class PatchCloud {
   readonly material: THREE.ShaderMaterial;
   readonly perImage: number;
   readonly grid: [number, number];
+  /** Images currently in the cloud. */
+  count: number;
+  readonly capacity: number;
   /** xyz of every patch, image-major: [image][patch][3] */
   readonly positions: Float32Array;
 
   private readonly slotAttr: THREE.BufferAttribute;
+  private readonly hiddenAttr: THREE.BufferAttribute;
+  private readonly posAttr: THREE.BufferAttribute;
+  private readonly colorAttr: THREE.BufferAttribute;
   private slotA = -1;
   private slotB = -1;
   private opacity = 0;
@@ -100,15 +112,18 @@ export class PatchCloud {
   private readonly _m = new THREE.Matrix4();
   private readonly _v = new THREE.Vector4();
 
-  constructor(data: PointsData, categories: Map<string, Category>, xyz: Float32Array, opts: PatchCloudOptions) {
+  constructor(data: PointsData, categories: Map<string, Category>, xyz: Float32Array, capacity: number, opts: PatchCloudOptions) {
     const info = data.patches!;
     const n = data.items.length;
     this.perImage = info.count;
     this.grid = info.grid;
-    this.positions = xyz;
+    this.count = n;
+    this.capacity = Math.max(capacity, n);
+    this.positions = new Float32Array(this.capacity * info.count * 3);
+    this.positions.set(xyz.subarray(0, n * info.count * 3));
 
     const total = n * info.count;
-    const colors = new Float32Array(total * 3);
+    const colors = new Float32Array(this.capacity * info.count * 3);
     for (let i = 0; i < n; i++) {
       const c = categories.get(data.items[i].category ?? '')!.color;
       for (let k = 0; k < info.count; k++) {
@@ -120,11 +135,19 @@ export class PatchCloud {
     }
 
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(xyz, 3));
-    geometry.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
-    this.slotAttr = new THREE.BufferAttribute(new Float32Array(total), 1);
+    this.posAttr = new THREE.BufferAttribute(this.positions, 3);
+    this.colorAttr = new THREE.BufferAttribute(colors, 3);
+    this.posAttr.setUsage(THREE.DynamicDrawUsage);
+    this.colorAttr.setUsage(THREE.DynamicDrawUsage);
+    geometry.setAttribute('position', this.posAttr);
+    geometry.setAttribute('aColor', this.colorAttr);
+    this.slotAttr = new THREE.BufferAttribute(new Float32Array(this.capacity * info.count), 1);
     this.slotAttr.setUsage(THREE.DynamicDrawUsage);
     geometry.setAttribute('aSlot', this.slotAttr);
+    this.hiddenAttr = new THREE.BufferAttribute(new Float32Array(this.capacity * info.count), 1);
+    this.hiddenAttr.setUsage(THREE.DynamicDrawUsage);
+    geometry.setAttribute('aHidden', this.hiddenAttr);
+    geometry.setDrawRange(0, total);
 
     this.material = new THREE.ShaderMaterial({
       vertexShader,
@@ -156,6 +179,29 @@ export class PatchCloud {
     this.points.renderOrder = 1;
   }
 
+  /** Add the patches of image `id` (must be the next slot). */
+  append(id: number, xyz: number[][], color: THREE.Color): boolean {
+    if (id !== this.count || id >= this.capacity || xyz.length !== this.perImage) return false;
+    const base = id * this.perImage * 3;
+    const col = this.colorAttr.array as Float32Array;
+    for (let k = 0; k < this.perImage; k++) {
+      const o = base + k * 3;
+      this.positions[o] = xyz[k][0];
+      this.positions[o + 1] = xyz[k][1];
+      this.positions[o + 2] = xyz[k][2];
+      col[o] = color.r;
+      col[o + 1] = color.g;
+      col[o + 2] = color.b;
+    }
+    this.count = id + 1;
+    (this.hiddenAttr.array as Float32Array).fill(0, id * this.perImage, (id + 1) * this.perImage);
+    this.hiddenAttr.needsUpdate = true;
+    this.posAttr.needsUpdate = true;
+    this.colorAttr.needsUpdate = true;
+    this.points.geometry.setDrawRange(0, this.count * this.perImage);
+    return true;
+  }
+
   setVisible(on: boolean): void {
     this.opacityTarget = on ? 1 : 0;
     if (on) this.points.visible = true;
@@ -163,6 +209,13 @@ export class PatchCloud {
 
   get visible(): boolean {
     return this.opacityTarget > 0;
+  }
+
+  /** Drop (or restore) every patch of one image. */
+  setHidden(image: number, on: boolean): void {
+    const p = this.perImage;
+    (this.hiddenAttr.array as Float32Array).fill(on ? 1 : 0, image * p, (image + 1) * p);
+    this.hiddenAttr.needsUpdate = true;
   }
 
   /** Highlight the patches of image `a` (white) and image `b` (accent). Pass -1 to clear. */

@@ -12,6 +12,7 @@ Outputs (in --out):
     similarity.bin    float32 N x N cosine similarity matrix (only when N <= --sim-max)
     patches.bin       float32 (N, P, 3): every patch token projected into a shared 3D PCA space
     patch_feats.bin   float32 (N, P, K): the same tokens in K PCA dims, for patch-level matching
+    models.pkl        the fitted PCA / UMAP projections, so serve.py can add images later
 """
 
 from __future__ import annotations
@@ -127,8 +128,10 @@ def fit_to_cube(xyz: np.ndarray, extent: float) -> np.ndarray:
     return (xyz - center) * scale
 
 
-def project_patches(tokens: np.ndarray, dims: int, extent: float, seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """PCA over all patch tokens. Returns (xyz (N,P,3), feats (N,P,dims), centroid xyz (N,3)).
+def project_patches(
+    tokens: np.ndarray, dims: int, extent: float, seed: int = 0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """PCA over all patch tokens. Returns (xyz (N,P,3), feats (N,P,dims), centroid xyz (N,3), fits).
 
     PCA is linear, so the centroid of an image's projected patches equals the projection of its
     mean token: the image's position in patch space is the center of its own patch cloud.
@@ -151,19 +154,25 @@ def project_patches(tokens: np.ndarray, dims: int, extent: float, seed: int = 0)
     center, scale = cube_transform(feats[:, :, :3].reshape(-1, 3), extent)
     xyz = ((feats[:, :, :3] - center) * scale).astype(np.float32)
     centroids = xyz.mean(axis=1)
-    return xyz, feats, centroids
+    return xyz, feats, centroids, {"patch_pca": pca, "patch_center": center, "patch_scale": scale}
 
 
-def layouts_from(E: np.ndarray, extent: float, use_umap: bool) -> dict[str, list]:
+def layouts_from(E: np.ndarray, extent: float, use_umap: bool) -> tuple[dict[str, list], dict]:
+    """Returns (layouts, fits). `fits` holds the fitted projections for projecting new images later."""
     from sklearn.decomposition import PCA
 
     n = E.shape[0]
     out: dict[str, list] = {}
+    fits: dict = {}
     k = min(3, n, E.shape[1])
     pca = np.zeros((n, 3), dtype=np.float32)
     if k >= 1 and n >= 2:
-        pca[:, :k] = PCA(n_components=k, random_state=0).fit_transform(E)
-    out["pca"] = fit_to_cube(pca, extent).round(4).tolist()
+        model = PCA(n_components=k, random_state=0).fit(E)
+        pca[:, :k] = model.transform(E)
+        fits["pca"] = model
+    center, scale = cube_transform(pca, extent)
+    fits["pca_center"], fits["pca_scale"] = center, scale
+    out["pca"] = ((pca - center) * scale).round(4).tolist()
 
     if use_umap:
         if n < 15:
@@ -172,9 +181,11 @@ def layouts_from(E: np.ndarray, extent: float, use_umap: bool) -> dict[str, list
             import umap
 
             reducer = umap.UMAP(n_components=3, metric="cosine", n_neighbors=min(15, n - 1), random_state=0)
-            um = reducer.fit_transform(E)
-            out["umap"] = fit_to_cube(np.asarray(um), extent).round(4).tolist()
-    return out
+            um = np.asarray(reducer.fit_transform(E))
+            center, scale = cube_transform(um, extent)
+            fits["umap"], fits["umap_center"], fits["umap_scale"] = reducer, center, scale
+            out["umap"] = ((um - center) * scale).round(4).tolist()
+    return out, fits
 
 
 def nearest_neighbors(sim: np.ndarray, k: int) -> list[list[dict]]:
@@ -254,13 +265,14 @@ def main() -> None:
 
     sim = (E @ E.T).astype(np.float32)
     np.clip(sim, -1.0, 1.0, out=sim)
-    layouts = layouts_from(E, args.extent, args.umap)
+    layouts, fits = layouts_from(E, args.extent, args.umap)
     neighbors = nearest_neighbors(sim, args.neighbors)
 
     patch_info = None
     if tokens is not None:
         print(f"projecting {tokens.shape[0] * tokens.shape[1]} patch tokens ...", flush=True)
-        xyz, feats, centroids = project_patches(tokens, args.patch_dims, args.extent)
+        xyz, feats, centroids, patch_fits = project_patches(tokens, args.patch_dims, args.extent)
+        fits.update(patch_fits)
         layouts["patch"] = centroids.round(4).tolist()
         xyz.tofile(args.out / "patches.bin")
         side = int(round(tokens.shape[1] ** 0.5))
@@ -300,6 +312,14 @@ def main() -> None:
 
     with open(args.out / "points.json", "w") as f:
         json.dump(data, f, separators=(",", ":"))
+
+    import pickle
+
+    fits.update({"model": args.model, "pool": args.pool, "extent": args.extent, "neighbors": args.neighbors,
+                 "sim_max": args.sim_max, "patch_feats_max": args.patch_feats_max,
+                 "thumb_size": args.thumb_size, "image_size": args.image_size})
+    with open(args.out / "models.pkl", "wb") as f:
+        pickle.dump(fits, f)
 
     print_similarity_report(sim, categories, [p.name for p in paths])
     print(f"\nwrote {args.out / 'points.json'} in {time.time() - t0:.1f}s")

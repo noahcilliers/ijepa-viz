@@ -3,7 +3,7 @@ import { CameraRig } from './controls';
 import { PointCloud } from './points';
 import { UI } from './ui';
 import { PatchCloud, matchPatches } from './patches';
-import { DATA_BASE, buildCategories, loadFloat32, loadPoints, loadSimilarity, similarityBetween, type PointsData } from './data';
+import { DATA_BASE, addCategory, buildCategories, loadFloat32, loadPoints, loadSimilarity, similarityBetween, type PointsData } from './data';
 
 const BG = new THREE.Color('#0b0d12');
 
@@ -32,8 +32,9 @@ async function main(): Promise<void> {
     compare: -1,
     hovered: -1,
     query: '',
-    activeCategories: null as Set<string> | null,
     grid: true,
+    lines: true,
+    shown: 0,
     sim: null as Float32Array | null,
     patchFeats: null as Float32Array | null,
   };
@@ -44,20 +45,32 @@ async function main(): Promise<void> {
       applyDimming();
     },
     onLayout: (name) => setLayout(name),
-    onToggleGrid: () => setGrid(!state.grid),
+    onGrid: (on) => setGrid(on),
+    onLines: (on) => {
+      state.lines = on;
+      updateLines();
+    },
+    onThumbnails: (on) => cloud.setThumbnails(on),
     onToggleFly: () => setFly(!rig.flyMode),
     onReset: () => rig.reset(),
     onSelect: (id) => select(id),
     onClose: () => clearSelection(),
-    onCategoryToggle: (name) => {
-      if (!state.activeCategories) state.activeCategories = new Set([name]);
-      else if (state.activeCategories.has(name)) {
-        state.activeCategories.delete(name);
-        if (state.activeCategories.size === 0) state.activeCategories = null;
-      } else state.activeCategories.add(name);
-      ui.setLegendState(state.activeCategories);
-      applyDimming();
+    onFiles: (files, category) => void addImages(files, category),
+    onUploadOpen: () => void refreshServerStatus(),
+    onCategoryToggle: (name, visible) => setHidden(idsOf(name), !visible),
+    onCategorySolo: (name) => {
+      const mine = new Set(idsOf(name));
+      const others = allIds().filter((id) => !mine.has(id));
+      const alreadyAlone = others.every((id) => cloud.hidden[id]) && [...mine].some((id) => !cloud.hidden[id]);
+      if (alreadyAlone) setHidden(allIds(), false);
+      else {
+        setHidden(others, true, false);
+        setHidden(mine, false, false);
+        refreshVisibility();
+      }
     },
+    onImageToggle: (id, visible) => setHidden([id], !visible),
+    onShowAll: (visible) => setHidden(allIds(), !visible),
   });
 
   if (!data || !data.items.length) {
@@ -67,7 +80,7 @@ async function main(): Promise<void> {
   }
 
   // ---------------------------------------------------------------- scene
-  const n = data.items.length;
+  let n = data.items.length;
   const categories = buildCategories(data.items);
   const extent = cloudExtent(data);
   const radius = extent.radius;
@@ -134,10 +147,11 @@ async function main(): Promise<void> {
     const info = data.patches;
     loadFloat32(DATA_BASE + info.file, n * info.count * 3).then((xyz) => {
       if (!xyz) return;
-      patches = new PatchCloud(data!, categories, xyz, {
+      patches = new PatchCloud(data!, categories, xyz, cloud.capacity, {
         background: BG, fogNear, fogFar, homeDistance: home, pixelRatio: renderer.getPixelRatio(),
       });
       scene.add(patches.points);
+      for (let i = 0; i < n; i++) if (cloud.hidden[i]) patches.setHidden(i, true);
       ui.setLayouts(Object.keys(data!.layouts), cloud.layout);
       if (cloud.layout === 'patch') patches.setVisible(true);
       refreshPatchHighlights();
@@ -150,10 +164,12 @@ async function main(): Promise<void> {
     });
   }
 
-  ui.setMeta(`${n.toLocaleString()} images · ${data.model.split('/').pop()} · ${data.pooling} pool`);
+  const setMeta = () => ui.setMeta(`${n.toLocaleString()} images · ${data!.model.split('/').pop()} · ${data!.pooling} pool`);
+  setMeta();
   ui.setLayouts(Object.keys(data.layouts).filter((l) => l !== 'patch'), cloud.layout);
-  ui.buildLegend(categories);
+  ui.buildDrawer(categories, data.items, cloud.hidden);
   ui.setGrid(true);
+  state.shown = n;
 
   // thumbnails stream in without blocking
   cloud.loadThumbnails(
@@ -169,16 +185,15 @@ async function main(): Promise<void> {
   const pointAt = (id: number, out = _p) => out.set(cloud.positions[id * 3], cloud.positions[id * 3 + 1], cloud.positions[id * 3 + 2]);
 
   function matchesFilter(id: number): boolean {
-    const it = data!.items[id];
-    if (state.activeCategories && !state.activeCategories.has(it.category)) return false;
     if (!state.query) return true;
+    const it = data!.items[id];
     return it.file.toLowerCase().includes(state.query) || it.category.toLowerCase().includes(state.query);
   }
 
   function applyDimming(): void {
     const t = cloud.alphaTarget;
-    const filterActive = !!state.query || !!state.activeCategories;
     let matches = 0;
+    let shown = 0;
     const neighborSet = new Set<number>();
     if (state.selected >= 0) {
       neighborSet.add(state.selected);
@@ -186,22 +201,55 @@ async function main(): Promise<void> {
       if (state.compare >= 0) neighborSet.add(state.compare);
     }
     for (let i = 0; i < n; i++) {
+      if (cloud.hidden[i]) {
+        t[i] = 0;
+        continue;
+      }
+      shown++;
       const m = matchesFilter(i);
       if (m) matches++;
       let a = m ? 1 : 0;
       if (state.selected >= 0) a = neighborSet.has(i) ? 1 : Math.min(a, 0.08);
       t[i] = a;
     }
+    state.shown = shown;
     cloud.touchAlpha();
-    ui.setSearchCount(matches, n, filterActive);
+    ui.setSearchCount(matches, shown, !!state.query);
+  }
+
+  // ------------------------------------------------------------ visibility
+  const allIds = () => Array.from({ length: n }, (_, i) => i);
+  const idsOf = (category: string) => allIds().filter((i) => (data!.items[i].category ?? '') === category);
+
+  /** Remove images from (or return them to) the scene. Hidden images are not drawn, picked or linked. */
+  function setHidden(ids: Iterable<number>, on: boolean, refresh = true): void {
+    let changed = false;
+    for (const id of ids) {
+      if (!!cloud.hidden[id] === on) continue;
+      cloud.setHidden(id, on);
+      patches?.setHidden(id, on);
+      changed = true;
+    }
+    if (changed && refresh) refreshVisibility();
+  }
+
+  function refreshVisibility(): void {
+    if (state.selected >= 0 && cloud.hidden[state.selected]) clearSelection();
+    else if (state.compare >= 0 && cloud.hidden[state.compare]) select(state.selected, false);
+    else if (state.selected >= 0) {
+      ui.showPanel(data!.items[state.selected], data!.neighbors[state.selected] ?? [], data!.items, cloud.hidden);
+      updateLines();
+    }
+    ui.updateDrawer();
+    applyDimming();
   }
 
   function updateLines(): void {
-    if (state.selected < 0) {
+    if (state.selected < 0 || !state.lines) {
       lineGeo.setDrawRange(0, 0);
       neighborLines.visible = false;
     } else {
-      const nbs = data!.neighbors[state.selected] ?? [];
+      const nbs = (data!.neighbors[state.selected] ?? []).filter((nb) => !cloud.hidden[nb.id]);
       const arr = new Float32Array(nbs.length * 6);
       const a = pointAt(state.selected).clone();
       nbs.forEach((nb, k) => {
@@ -289,10 +337,13 @@ async function main(): Promise<void> {
   }
 
   function select(id: number, fly = true): void {
+    if (cloud.hidden[id]) setHidden([id], false, false); // asking for it brings it back
     state.selected = id;
     state.compare = -1;
     ui.hideCompare();
-    ui.showPanel(data!.items[id], data!.neighbors[id] ?? [], data!.items);
+    ui.showPanel(data!.items[id], data!.neighbors[id] ?? [], data!.items, cloud.hidden);
+    ui.setDrawerSelection(id, -1);
+    ui.updateDrawer();
     ui.setPatchHint(
       inPatchMode() && data!.patches
         ? `Showing all ${data!.patches.count} patch embeddings of this image. Hover a point to see where it sits in the picture.`
@@ -322,9 +373,12 @@ async function main(): Promise<void> {
       select(id);
       return;
     }
+    if (cloud.hidden[id]) setHidden([id], false, false);
     state.compare = id;
     const sim = similarityBetween(data!, state.sim, state.selected, id);
     ui.showCompare(data!.items[state.selected], data!.items[id], sim);
+    ui.setDrawerSelection(state.selected, id);
+    ui.updateDrawer();
     refreshHighlights();
     refreshPatchHighlights();
     applyDimming();
@@ -336,6 +390,7 @@ async function main(): Promise<void> {
     state.selected = -1;
     state.compare = -1;
     ui.hidePanel();
+    ui.setDrawerSelection(-1, -1);
     refreshHighlights();
     refreshPatchHighlights();
     applyDimming();
@@ -353,6 +408,134 @@ async function main(): Promise<void> {
     rig.setFlyMode(on);
     ui.setFly(on);
   }
+
+  // --------------------------------------------------------------- uploads
+  const SERVER_HINT = 'Start the embedding server: <code>python serve.py --data ./public/data</code>';
+
+  async function serverStatus(): Promise<{ n: number; model: string } | null> {
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (!r.ok) return null;
+      const j = await r.json();
+      return j.ok ? j : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function refreshServerStatus(): Promise<boolean> {
+    const s = await serverStatus();
+    if (s) ui.setUploadStatus(`Embedding server connected · ${s.model.split('/').pop()}`, 'ok');
+    else ui.setUploadStatus(SERVER_HINT, 'err');
+    return !!s;
+  }
+
+  interface EmbedResponse {
+    item: PointsData['items'][number];
+    layouts: Record<string, number[]>;
+    neighbors: PointsData['neighbors'][number];
+    updatedNeighbors: Record<string, PointsData['neighbors'][number]>;
+    patches: { xyz: number[][]; feats?: number[][] } | null;
+    seconds: number;
+  }
+
+  /** Add one embedded image to the data and the scene. Returns its id, or -1 if the scene had to reload. */
+  function appendImage(resp: EmbedResponse): number {
+    const d = data!;
+    const item = resp.item;
+    const id = item.id;
+    if (id !== d.items.length) {
+      location.reload(); // the data folder changed under us; start over from disk
+      return -1;
+    }
+    const cat = addCategory(categories, item.category ?? '');
+    cat.count++;
+    d.items.push(item);
+    for (const key of Object.keys(d.layouts)) d.layouts[key].push(resp.layouts[key] ?? resp.layouts.pca ?? [0, 0, 0]);
+    d.neighbors.push(resp.neighbors);
+    for (const [k, list] of Object.entries(resp.updatedNeighbors ?? {})) d.neighbors[Number(k)] = list;
+    n = d.items.length;
+
+    if (!cloud.append(id, resp.layouts, cloud.layout, cat.color, DATA_BASE + item.thumb)) {
+      location.reload();
+      return -1;
+    }
+    if (patches && resp.patches) {
+      patches.append(id, resp.patches.xyz, cat.color);
+      const dims = d.patches?.featDims ?? 0;
+      if (resp.patches.feats && state.patchFeats && dims) {
+        const grown = new Float32Array(state.patchFeats.length + resp.patches.feats.length * dims);
+        grown.set(state.patchFeats);
+        let o = state.patchFeats.length;
+        for (const row of resp.patches.feats) for (const v of row) grown[o++] = v;
+        state.patchFeats = grown;
+      } else if (!resp.patches.feats) {
+        state.patchFeats = null;
+      }
+    }
+    ui.buildDrawer(categories, d.items, cloud.hidden);
+    setMeta();
+    if (state.selected >= 0 && resp.updatedNeighbors?.[String(state.selected)]) {
+      ui.showPanel(d.items[state.selected], d.neighbors[state.selected], d.items, cloud.hidden);
+      refreshHighlights();
+      updateLines();
+    }
+    applyDimming();
+    return id;
+  }
+
+  let uploading = false;
+  async function addImages(files: File[], category: string): Promise<void> {
+    if (!files.length || uploading) return;
+    ui.setUploadOpen(true);
+    if (!(await refreshServerStatus())) return;
+    uploading = true;
+    let done = 0;
+    let lastId = -1;
+    let failed = 0;
+    const d = data!;
+    for (const f of files) {
+      ui.setLoading(done, files.length, 'Embedding');
+      ui.setUploadStatus(`Embedding ${f.name} (${done + 1} of ${files.length})`, 'ok');
+      try {
+        const url = `/api/embed?name=${encodeURIComponent(f.name)}&category=${encodeURIComponent(category)}`;
+        const r = await fetch(url, { method: 'POST', body: f, headers: { 'Content-Type': f.type || 'application/octet-stream' } });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error ?? r.statusText);
+        const id = appendImage(j as EmbedResponse);
+        if (id < 0) return;
+        lastId = id;
+      } catch (err) {
+        failed++;
+        console.warn('embed failed', f.name, err);
+      }
+      done++;
+    }
+    ui.setLoading(files.length, files.length, 'Embedding');
+    try {
+      const j = await (await fetch('/api/flush', { method: 'POST' })).json();
+      if (j.similarity) {
+        d.similarity = j.similarity;
+        state.sim = await loadSimilarity(d);
+      } else {
+        d.similarity = undefined;
+        state.sim = null;
+      }
+    } catch {
+      /* similarity stays stale until the next load */
+    }
+    uploading = false;
+    const added = files.length - failed;
+    ui.setUploadStatus(
+      failed ? `Added ${added} of ${files.length}; ${failed} failed (see the console).` : `Added ${added} image${added === 1 ? '' : 's'}.`,
+      failed ? 'err' : 'ok',
+    );
+    if (lastId >= 0) {
+      select(lastId);
+      if (state.compare >= 0) updateMatchLines();
+    }
+  }
+  void refreshServerStatus();
 
   // --------------------------------------------------------------- picking
   let pointerX = -1;
@@ -406,6 +589,7 @@ async function main(): Promise<void> {
       case 'KeyR': rig.reset(); break;
       case 'KeyF': setFly(!rig.flyMode); break;
       case 'KeyG': setGrid(!state.grid); break;
+      case 'KeyL': ui.setDrawerOpen(!ui.drawerOpen); break;
       case 'KeyP':
         if (patches) setLayout(inPatchMode() ? 'pca' : 'patch');
         break;
@@ -454,7 +638,7 @@ async function main(): Promise<void> {
       fps = Math.round((frames * 1000) / (now - fpsT));
       frames = 0;
       fpsT = now;
-      ui.setStats(`${fps} fps · ${n.toLocaleString()} pts`);
+      ui.setStats(state.shown === n ? `${fps} fps · ${n.toLocaleString()} pts` : `${fps} fps · ${state.shown.toLocaleString()} / ${n.toLocaleString()} pts`);
     }
   };
   const loop = (now: number) => {
@@ -467,7 +651,7 @@ async function main(): Promise<void> {
       for (let i = 0; i < frames; i++) frame(last + ms);
     };
     (window as any).__explorer.now = () => last;
-    Object.assign((window as any).__explorer, { select, compareWith, setLayout, clearSelection });
+    Object.assign((window as any).__explorer, { select, compareWith, setLayout, clearSelection, addImages, setHidden, ui });
   }
 
   function animateEmpty(): void {

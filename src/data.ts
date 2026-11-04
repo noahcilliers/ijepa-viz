@@ -112,6 +112,22 @@ export function buildCategories(items: Item[]): Map<string, Category> {
   return out;
 }
 
+/** Register a category that appeared after load (an upload). */
+export function addCategory(categories: Map<string, Category>, name: string): Category {
+  const existing = categories.get(name);
+  if (existing) return existing;
+  if (name === '') {
+    const c = { name, hex: NEUTRAL, color: new THREE.Color(NEUTRAL), count: 0 };
+    categories.set('', c);
+    return c;
+  }
+  const i = [...categories.keys()].filter((k) => k !== '').length;
+  const hex = i < PALETTE.length ? PALETTE[i] : hslHex((i * 137.508) % 360, 62, 68);
+  const c = { name, hex, color: new THREE.Color(hex), count: 0 };
+  categories.set(name, c);
+  return c;
+}
+
 function hslHex(h: number, s: number, l: number): string {
   const c = new THREE.Color().setHSL(h / 360, s / 100, l / 100);
   return '#' + c.getHexString();

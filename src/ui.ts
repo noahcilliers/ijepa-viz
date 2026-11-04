@@ -5,13 +5,34 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 export interface UICallbacks {
   onSearch(query: string): void;
   onLayout(name: string): void;
-  onToggleGrid(): void;
+  onGrid(on: boolean): void;
+  onLines(on: boolean): void;
+  onThumbnails(on: boolean): void;
   onToggleFly(): void;
   onReset(): void;
   onSelect(id: number): void;
   onClose(): void;
-  onCategoryToggle(name: string): void;
+  /** Show or hide every image of a category. */
+  onCategoryToggle(name: string, visible: boolean): void;
+  /** Show only this category (or everything again if it is already alone). */
+  onCategorySolo(name: string): void;
+  onImageToggle(id: number, visible: boolean): void;
+  onShowAll(visible: boolean): void;
+  onFiles(files: File[], category: string): void;
+  onUploadOpen(): void;
 }
+
+interface DrawerCategory {
+  name: string;
+  ids: number[];
+  el: HTMLElement;
+  box: HTMLElement;
+  count: HTMLElement;
+  grid: HTMLElement;
+  built: boolean;
+}
+
+const DRAWER_KEY = 'jepa-explorer:drawer';
 
 export class UI {
   private readonly tooltip = $('tooltip');
@@ -37,20 +58,37 @@ export class UI {
   private readonly compareFile = $('compare-file');
   private readonly search = $<HTMLInputElement>('search');
   private readonly searchCount = $('search-count');
-  private readonly legend = $('legend');
+  private readonly drawer = $('drawer');
+  private readonly drawerList = $('drawer-list');
+  private readonly drawerCount = $('drawer-count');
+  private readonly btnLayers = $('btn-layers');
+  private readonly optGrid = $<HTMLInputElement>('opt-grid');
+  private readonly optLines = $<HTMLInputElement>('opt-lines');
+  private readonly optThumbs = $<HTMLInputElement>('opt-thumbs');
   private readonly stats = $('stats');
   private readonly loading = $('loading');
   private readonly loadingFill = $('loading-fill');
   private readonly loadingText = $('loading-text');
-  private readonly btnGrid = $('btn-grid');
   private readonly btnFly = $('btn-fly');
   private readonly layoutToggle = $('layout-toggle');
+  private readonly upload = $('upload');
+  private readonly uploadStatus = $('upload-status');
+  private readonly uploadCategory = $<HTMLInputElement>('upload-category');
+  private readonly btnAdd = $('btn-add');
+  private readonly dropOverlay = $('drop-overlay');
 
   private tooltipId = -1;
   private tooltipSubText = '';
   private tooltipX = 0;
   private tooltipY = 0;
   private categories: Map<string, Category> = new Map();
+  private items: Item[] = [];
+  private hidden: Uint8Array = new Uint8Array(0);
+  private drawerCats: DrawerCategory[] = [];
+  private expanded = new Set<string>();
+  private thumbEls = new Map<number, HTMLElement>();
+  private selectedId = -1;
+  private comparedId = -1;
 
   constructor(private readonly cb: UICallbacks) {
     let timer = 0;
@@ -70,7 +108,18 @@ export class UI {
     this.layoutToggle.querySelectorAll<HTMLButtonElement>('button').forEach((b) =>
       b.addEventListener('click', () => cb.onLayout(b.dataset.layout!)),
     );
-    this.btnGrid.addEventListener('click', cb.onToggleGrid);
+    this.optGrid.addEventListener('change', () => cb.onGrid(this.optGrid.checked));
+    this.optLines.addEventListener('change', () => cb.onLines(this.optLines.checked));
+    this.optThumbs.addEventListener('change', () => cb.onThumbnails(this.optThumbs.checked));
+    this.btnLayers.addEventListener('click', () => this.setDrawerOpen(!!this.drawer.hidden));
+    $('show-all').addEventListener('click', () => cb.onShowAll(true));
+    $('hide-all').addEventListener('click', () => cb.onShowAll(false));
+    let drawerOpen = window.innerWidth > 900;
+    try {
+      const saved = localStorage.getItem(DRAWER_KEY);
+      if (saved !== null) drawerOpen = saved === '1';
+    } catch { /* private mode */ }
+    this.setDrawerOpen(drawerOpen, false);
     this.btnFly.addEventListener('click', cb.onToggleFly);
     $('btn-reset').addEventListener('click', cb.onReset);
     $('panel-close').addEventListener('click', cb.onClose);
@@ -82,7 +131,52 @@ export class UI {
     });
     document.addEventListener('pointerdown', (e) => {
       if (!help.contains(e.target as Node)) help.classList.remove('open');
+      if (!this.upload.contains(e.target as Node) && !this.btnAdd.contains(e.target as Node)) this.setUploadOpen(false);
     });
+
+    // uploads: button + popover, file picker, and drag-and-drop anywhere
+    this.btnAdd.addEventListener('click', () => this.setUploadOpen(!!this.upload.hidden));
+    const files = $<HTMLInputElement>('upload-files');
+    $('upload-choose').addEventListener('click', () => files.click());
+    files.addEventListener('change', () => {
+      if (files.files?.length) cb.onFiles([...files.files], this.uploadCategory.value.trim());
+      files.value = '';
+    });
+    this.uploadCategory.addEventListener('keydown', (e) => e.stopPropagation());
+    let dragDepth = 0;
+    window.addEventListener('dragenter', (e) => {
+      if (!e.dataTransfer?.types.includes('Files')) return;
+      e.preventDefault();
+      dragDepth++;
+      this.dropOverlay.hidden = false;
+    });
+    window.addEventListener('dragover', (e) => {
+      if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+    });
+    window.addEventListener('dragleave', () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) this.dropOverlay.hidden = true;
+    });
+    window.addEventListener('drop', (e) => {
+      dragDepth = 0;
+      this.dropOverlay.hidden = true;
+      if (!e.dataTransfer?.files.length) return;
+      e.preventDefault();
+      const imgs = [...e.dataTransfer.files].filter((f) => /^image\/(jpeg|png|webp)$/.test(f.type));
+      if (imgs.length) cb.onFiles(imgs, this.uploadCategory.value.trim());
+      else this.setUploadStatus('Only JPEG, PNG and WebP images can be added.', 'err');
+    });
+  }
+
+  setUploadOpen(open: boolean): void {
+    this.upload.hidden = !open;
+    this.btnAdd.setAttribute('aria-expanded', String(open));
+    if (open) this.cb.onUploadOpen();
+  }
+
+  setUploadStatus(html: string, kind: 'ok' | 'err' | '' = ''): void {
+    this.uploadStatus.innerHTML = html;
+    this.uploadStatus.className = `upload-status ${kind}`;
   }
 
   setMeta(text: string): void {
@@ -102,7 +196,25 @@ export class UI {
   }
 
   setGrid(on: boolean): void {
-    this.btnGrid.setAttribute('aria-pressed', String(on));
+    this.optGrid.checked = on;
+  }
+
+  get linesEnabled(): boolean {
+    return this.optLines.checked;
+  }
+
+  get drawerOpen(): boolean {
+    return !this.drawer.hidden;
+  }
+
+  setDrawerOpen(open: boolean, remember = true): void {
+    this.drawer.hidden = !open;
+    this.btnLayers.setAttribute('aria-pressed', String(open));
+    if (remember) {
+      try {
+        localStorage.setItem(DRAWER_KEY, open ? '1' : '0');
+      } catch { /* ignore */ }
+    }
   }
 
   setFly(on: boolean): void {
@@ -116,7 +228,7 @@ export class UI {
   setLoading(done: number, total: number, label = 'Loading thumbnails'): void {
     if (done >= total) {
       this.loadingFill.style.width = '100%';
-      this.loadingText.textContent = `${total} thumbnails loaded`;
+      this.loadingText.textContent = label === 'Embedding' ? `Embedded ${total} image${total === 1 ? '' : 's'}` : `${total} thumbnails loaded`;
       this.loading.classList.add('done');
       return;
     }
@@ -129,35 +241,121 @@ export class UI {
     this.searchCount.textContent = active ? `${matches} / ${total}` : '';
   }
 
-  // ---------------------------------------------------------------- legend
+  // ---------------------------------------------------------------- drawer
 
-  buildLegend(categories: Map<string, Category>): void {
+  /** (Re)build the category list. Call again when images or categories are added. */
+  buildDrawer(categories: Map<string, Category>, items: Item[], hidden: Uint8Array): void {
     this.categories = categories;
-    const named = [...categories.values()].filter((c) => c.name !== '');
-    this.legend.innerHTML = '';
-    if (named.length === 0) {
-      this.legend.hidden = true;
-      return;
+    this.items = items;
+    this.hidden = hidden;
+    const byCat = new Map<string, number[]>();
+    for (const it of items) {
+      const key = it.category ?? '';
+      let list = byCat.get(key);
+      if (!list) byCat.set(key, (list = []));
+      list.push(it.id);
     }
-    this.legend.hidden = false;
-    for (const c of named) {
+    const names = [...categories.keys()].filter((k) => k !== '' && byCat.has(k));
+    if (byCat.has('')) names.push('');
+
+    this.drawerList.innerHTML = '';
+    this.drawerCats = [];
+    this.thumbEls.clear();
+    if (names.length === 0) {
+      this.drawerList.innerHTML = '<div class="drawer-empty">No images yet.</div>';
+    }
+    for (const name of names) {
+      const c = categories.get(name)!;
+      const ids = byCat.get(name)!;
       const el = document.createElement('div');
-      el.className = 'legend-item';
-      el.dataset.name = c.name;
-      el.title = `Click to isolate ${c.name}`;
-      el.innerHTML = `<span class="legend-swatch" style="background:${c.hex}"></span><span class="legend-name"></span><span class="legend-count">${c.count}</span>`;
-      el.querySelector('.legend-name')!.textContent = c.name;
-      el.addEventListener('click', () => this.cb.onCategoryToggle(c.name));
-      this.legend.appendChild(el);
+      el.className = 'cat';
+      el.style.setProperty('--c', c.hex);
+      el.innerHTML =
+        `<div class="cat-row">` +
+        `<button class="cat-box" role="checkbox" aria-checked="true"></button>` +
+        `<span class="cat-name"></span><span class="cat-count"></span>` +
+        `<button class="cat-only" title="Show only these images">only</button>` +
+        `<button class="cat-expand" title="Pick individual images" aria-expanded="false">` +
+        `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>` +
+        `</button></div><div class="cat-grid" hidden></div>`;
+      const nameEl = el.querySelector<HTMLElement>('.cat-name')!;
+      nameEl.textContent = name || 'uncategorized';
+      nameEl.classList.toggle('unnamed', name === '');
+      const box = el.querySelector<HTMLElement>('.cat-box')!;
+      const grid = el.querySelector<HTMLElement>('.cat-grid')!;
+      const expand = el.querySelector<HTMLElement>('.cat-expand')!;
+      const entry: DrawerCategory = { name, ids, el, box, count: el.querySelector('.cat-count')!, grid, built: false };
+      const toggle = () => this.cb.onCategoryToggle(name, box.getAttribute('aria-checked') !== 'true');
+      box.addEventListener('click', toggle);
+      nameEl.addEventListener('click', toggle);
+      el.querySelector('.cat-only')!.addEventListener('click', () => this.cb.onCategorySolo(name));
+      expand.addEventListener('click', () => this.setExpanded(entry, !!grid.hidden));
+      this.drawerList.appendChild(el);
+      this.drawerCats.push(entry);
+      if (this.expanded.has(name)) this.setExpanded(entry, true);
+    }
+    this.updateDrawer();
+  }
+
+  private setExpanded(entry: DrawerCategory, open: boolean): void {
+    if (open && !entry.built) {
+      entry.built = true;
+      const frag = document.createDocumentFragment();
+      for (const id of entry.ids) frag.appendChild(this.makeThumb(id));
+      entry.grid.appendChild(frag);
+    }
+    entry.grid.hidden = !open;
+    entry.el.querySelector('.cat-expand')!.setAttribute('aria-expanded', String(open));
+    if (open) this.expanded.add(entry.name);
+    else this.expanded.delete(entry.name);
+    if (open) this.updateDrawer();
+  }
+
+  private makeThumb(id: number): HTMLElement {
+    const it = this.items[id];
+    const b = document.createElement('button');
+    b.className = 'cat-thumb';
+    b.title = `${it.file}\nClick to show or hide · double-click to focus`;
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.alt = '';
+    img.src = DATA_BASE + it.thumb;
+    b.appendChild(img);
+    b.addEventListener('click', () => this.cb.onImageToggle(id, !!this.hidden[id]));
+    b.addEventListener('dblclick', () => this.cb.onSelect(id));
+    this.thumbEls.set(id, b);
+    return b;
+  }
+
+  /** Refresh checkbox states, counts and thumbnail states from the hidden flags. */
+  updateDrawer(): void {
+    let shown = 0;
+    const total = this.items.length;
+    for (let i = 0; i < total; i++) if (!this.hidden[i]) shown++;
+    this.drawerCount.textContent = total === 0 ? '' : shown === total ? `${total}` : `${shown} of ${total}`;
+
+    const visibleCats = this.drawerCats.filter((c) => c.ids.some((id) => !this.hidden[id]));
+    for (const c of this.drawerCats) {
+      let on = 0;
+      for (const id of c.ids) if (!this.hidden[id]) on++;
+      const state = on === 0 ? 'false' : on === c.ids.length ? 'true' : 'mixed';
+      c.box.setAttribute('aria-checked', state);
+      c.count.textContent = on === c.ids.length ? `${c.ids.length}` : `${on} / ${c.ids.length}`;
+      c.el.classList.toggle('off', on === 0);
+      c.el.classList.toggle('solo', visibleCats.length === 1 && visibleCats[0] === c && this.drawerCats.length > 1);
+      if (c.built) for (const id of c.ids) this.thumbEls.get(id)?.classList.toggle('off', !!this.hidden[id]);
     }
   }
 
-  setLegendState(active: Set<string> | null): void {
-    this.legend.querySelectorAll<HTMLElement>('.legend-item').forEach((el) => {
-      const name = el.dataset.name!;
-      el.classList.toggle('off', active !== null && !active.has(name));
-      el.classList.toggle('active', active !== null && active.has(name));
-    });
+  /** Outline the selected / compared image in the thumbnail grids. */
+  setDrawerSelection(selected: number, compared: number): void {
+    this.thumbEls.get(this.selectedId)?.classList.remove('selected');
+    this.thumbEls.get(this.comparedId)?.classList.remove('compared');
+    this.selectedId = selected;
+    this.comparedId = compared;
+    this.thumbEls.get(selected)?.classList.add('selected');
+    this.thumbEls.get(compared)?.classList.add('compared');
   }
 
   // --------------------------------------------------------------- tooltip
@@ -202,7 +400,7 @@ export class UI {
 
   // ----------------------------------------------------------------- panel
 
-  showPanel(item: Item, neighbors: Neighbor[], items: Item[]): void {
+  showPanel(item: Item, neighbors: Neighbor[], items: Item[], hidden?: Uint8Array): void {
     this.panelImg.src = DATA_BASE + (item.image ?? item.thumb);
     this.panelImg.alt = item.file;
     this.panelFile.textContent = item.file;
@@ -213,7 +411,7 @@ export class UI {
       const other = items[nb.id];
       if (!other) continue;
       const li = document.createElement('li');
-      li.className = 'neighbor';
+      li.className = hidden?.[nb.id] ? 'neighbor is-hidden' : 'neighbor';
       li.innerHTML = `<img loading="lazy" alt="" /><div class="neighbor-text"><div class="neighbor-file"></div><div class="neighbor-bar"><span></span></div></div><div class="neighbor-sim"></div>`;
       (li.querySelector('img') as HTMLImageElement).src = DATA_BASE + other.thumb;
       li.querySelector('.neighbor-file')!.textContent = other.file;
