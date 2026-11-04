@@ -1,0 +1,12 @@
+[
+  {
+    "dir": "data",
+    "label": "I-JEPA ViT-H/14",
+    "model": "facebook/ijepa_vith14_1k"
+  },
+  {
+    "dir": "resnet",
+    "label": "ResNet-50",
+    "model": "microsoft/resnet-50"
+  }
+]

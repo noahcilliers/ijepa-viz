@@ -1,17 +1,19 @@
 #!/usr/bin/env python
-"""Local embedding server: keeps the I-JEPA encoder loaded and adds uploaded images to a data set.
+"""Local embedding server: keeps the encoders loaded and adds uploaded images to the data sets.
 
-    python serve.py --data ./public/data [--port 8765]
+    python serve.py --data ./public/data ./public/resnet [--port 8765]
 
-The data folder must have been produced by embed.py (it needs models.pkl, the fitted
-projections). New images are embedded, projected into the existing PCA / UMAP / patch
-layouts, written into the data folder (thumbs, images, points.json, embeddings.npy,
-patches.bin, patch_feats.bin) and returned to the viewer, which adds them in place.
+Each data folder must have been produced by embed.py (it needs models.pkl, the fitted
+projections); its encoder is loaded once and shared between folders that use the same model.
+New images are embedded, projected into the folder's existing PCA / UMAP / patch layouts,
+written into it (thumbs, images, points.json, embeddings.npy, patches.bin, patch_feats.bin)
+and returned to the viewer, which adds them in place.
 
-Endpoints (the Vite dev server proxies /api to this server):
-    GET  /api/status                      -> {"ok": true, "model": ..., "n": N, ...}
-    POST /api/embed?name=<file>&category= -> body = image bytes; returns the new item
-    POST /api/flush                       -> rewrites similarity.bin
+Endpoints (the Vite dev server proxies /api to this server; `data` is the folder name and
+defaults to the first one given):
+    GET  /api/status?data=<dir>                      -> {"ok": true, "model": ..., "n": N, ...}
+    POST /api/embed?data=<dir>&name=<file>&category= -> body = image bytes; returns the new item
+    POST /api/flush?data=<dir>                       -> rewrites similarity.bin
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 from PIL import Image, ImageOps
 
-from embed import pick_device
+from embed import Backbone, default_label, pick_device
 
 SAFE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_. ()")
 
@@ -43,8 +45,9 @@ def safe_name(name: str, fallback: str) -> str:
 
 
 class Engine:
-    def __init__(self, data_dir: Path, device_name: str | None, batch_size: int = 8):
+    def __init__(self, data_dir: Path, backbones: dict[str, Backbone], device):
         self.dir = data_dir
+        self.name = data_dir.name
         self.lock = threading.Lock()
         self.dirty_similarity = False
 
@@ -61,32 +64,27 @@ class Engine:
         self.image_size = int(self.fits.get("image_size", 1024))
         self.pool = self.fits.get("pool", "mean")
         self.model_name = self.fits.get("model", self.data.get("model"))
-        self.batch_size = batch_size
+        self.label = self.fits.get("label") or self.data.get("label") or default_label(self.model_name)
         if len(self.E) != len(self.data["items"]):
-            sys.exit("embeddings.npy and points.json disagree; re-run embed.py")
+            sys.exit(f"{data_dir}: embeddings.npy and points.json disagree; re-run embed.py")
 
-        import torch
-        from transformers import AutoImageProcessor, AutoModel
-
-        self.torch = torch
-        self.device = pick_device(device_name)
-        print(f"loading {self.model_name} on {self.device} ...", flush=True)
-        self.proc = AutoImageProcessor.from_pretrained(self.model_name)
-        self.model = AutoModel.from_pretrained(self.model_name).eval().to(self.device)
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        print(f"ready: {len(self.E)} images in {data_dir}", flush=True)
+        if self.model_name not in backbones:
+            backbones[self.model_name] = Backbone(self.model_name, device)
+        self.backbone = backbones[self.model_name]
+        print(f"ready: '{self.label}' with {len(self.E)} images in {data_dir}", flush=True)
 
     # ------------------------------------------------------------------ status
 
     def status(self) -> dict:
         return {
             "ok": True,
+            "data": self.name,
             "model": self.model_name,
+            "label": self.label,
             "n": len(self.data["items"]),
             "layouts": list(self.data["layouts"].keys()),
             "patches": bool(self.data.get("patches")),
-            "device": str(self.device),
+            "device": str(self.backbone.device),
         }
 
     # ------------------------------------------------------------------- embed
@@ -95,11 +93,7 @@ class Engine:
         with self.lock:
             img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
             t0 = time.time()
-            with self.torch.no_grad():
-                inputs = self.proc(images=[img], return_tensors="pt").to(self.device)
-                tokens = self.model(**inputs).last_hidden_state  # (1, P, D)
-                emb = tokens.mean(dim=1) if self.pool == "mean" else tokens.max(dim=1).values
-                emb = self.torch.nn.functional.normalize(emb, dim=-1)
+            emb, tokens = self.backbone.embed([img], self.pool)
             e = emb.float().cpu().numpy()[0]
             toks = tokens.float().cpu().numpy()[0]
             dt = time.time() - t0
@@ -204,10 +198,16 @@ class Engine:
 
 
 class Handler(BaseHTTPRequestHandler):
-    engine: Engine
+    engines: dict[str, Engine] = {}
 
     def log_message(self, fmt: str, *args) -> None:  # quieter log
         sys.stderr.write("%s %s\n" % (self.command, fmt % args))
+
+    def _engine(self, query: dict[str, list[str]]) -> Engine | None:
+        name = query.get("data", [""])[0]
+        if not name:
+            return next(iter(self.engines.values()))
+        return self.engines.get(name)
 
     def _send(self, code: int, payload: dict) -> None:
         body = json.dumps(payload).encode()
@@ -224,16 +224,26 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True})
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
-        if path == "/api/status":
-            self._send(200, self.engine.status())
-        else:
+        url = urlparse(self.path)
+        q = parse_qs(url.query)
+        if url.path != "/api/status":
             self._send(404, {"error": "not found"})
+            return
+        engine = self._engine(q)
+        if engine is None:
+            self._send(404, {"ok": False, "error": f"no data set '{q.get('data', [''])[0]}' is served", "datasets": list(self.engines)})
+            return
+        self._send(200, {**engine.status(), "datasets": list(self.engines)})
 
     def do_POST(self) -> None:
         url = urlparse(self.path)
+        q = parse_qs(url.query)
+        engine = self._engine(q)
+        if engine is None:
+            self._send(404, {"error": f"no data set '{q.get('data', [''])[0]}' is served"})
+            return
         if url.path == "/api/flush":
-            self._send(200, self.engine.flush())
+            self._send(200, engine.flush())
             return
         if url.path != "/api/embed":
             self._send(404, {"error": "not found"})
@@ -242,12 +252,11 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0 or length > 64 * 1024 * 1024:
             self._send(400, {"error": "empty or oversized body"})
             return
-        q = parse_qs(url.query)
         name = q.get("name", [""])[0]
         category = safe_name(q.get("category", [""])[0], "").strip()
         raw = self.rfile.read(length)
         try:
-            result = self.engine.add_image(raw, name, category)
+            result = engine.add_image(raw, name, category)
         except Exception as exc:  # noqa: BLE001
             self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
             return
@@ -256,24 +265,31 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", type=Path, default=Path("public/data"))
+    p.add_argument("--data", type=Path, nargs="+", default=[Path("public/data")], help="one or more data folders written by embed.py")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--device", default=None)
     args = p.parse_args()
-    if not (args.data / "models.pkl").exists():
-        sys.exit(f"{args.data / 'models.pkl'} not found: run embed.py first (it writes the fitted projections)")
+    for d in args.data:
+        if not (d / "models.pkl").exists():
+            sys.exit(f"{d / 'models.pkl'} not found: run embed.py first (it writes the fitted projections)")
+    names = [d.resolve().name for d in args.data]
+    if len(set(names)) != len(names):
+        sys.exit("data folders must have distinct names (the viewer addresses them by folder name)")
 
-    Handler.engine = Engine(args.data, args.device)
+    device = pick_device(args.device)
+    backbones: dict[str, Backbone] = {}
+    Handler.engines = {d.resolve().name: Engine(d, backbones, device) for d in args.data}
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"embedding server on http://{args.host}:{args.port}  (ctrl-c to stop)", flush=True)
+    print(f"embedding server on http://{args.host}:{args.port}  serving {', '.join(names)}  (ctrl-c to stop)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        if Handler.engine.dirty_similarity:
-            Handler.engine.flush()
+        for engine in Handler.engines.values():
+            if engine.dirty_similarity:
+                engine.flush()
 
 
 if __name__ == "__main__":

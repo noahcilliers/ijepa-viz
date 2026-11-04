@@ -57,10 +57,14 @@ html, body {
 
 .brand {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 10px;
   padding: 0 2px;
+  flex-wrap: wrap;
 }
+.segmented-sm { height: 26px; padding: 2px; }
+.segmented-sm button { padding: 0 10px; font-size: 11.5px; }
+.segmented-sm[hidden] { display: none; }
 .brand-title { font-weight: 600; letter-spacing: 0.01em; font-size: 14px; }
 .brand-meta { color: var(--text-dim); font-size: 12px; }
 

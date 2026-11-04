@@ -3,7 +3,10 @@ import { CameraRig } from './controls';
 import { PointCloud } from './points';
 import { UI } from './ui';
 import { PatchCloud, matchPatches } from './patches';
-import { DATA_BASE, addCategory, buildCategories, loadFloat32, loadPoints, loadSimilarity, similarityBetween, type PointsData } from './data';
+import {
+  DATA_BASE, DATA_DIR, addCategory, buildCategories, loadDatasets, loadFloat32, loadPoints, loadSimilarity, modelLabel,
+  similarityBetween, type PointsData,
+} from './data';
 
 const BG = new THREE.Color('#0b0d12');
 
@@ -21,10 +24,16 @@ async function main(): Promise<void> {
   const rig = new CameraRig(camera, canvas);
 
   let data: PointsData | null = null;
-  try {
-    data = await loadPoints();
-  } catch {
-    data = null;
+  const [loaded, datasets] = await Promise.all([loadPoints().catch(() => null), loadDatasets()]);
+  data = loaded;
+
+  /** Switch encoder: each run is its own folder, so reload on it and keep the layout choice. */
+  function switchDataset(dir: string): void {
+    const url = new URL(location.href);
+    if (dir === 'data') url.searchParams.delete('data');
+    else url.searchParams.set('data', dir);
+    if (data) url.searchParams.set('layout', cloud.layout);
+    location.href = url.toString();
   }
 
   const state = {
@@ -45,6 +54,7 @@ async function main(): Promise<void> {
       applyDimming();
     },
     onLayout: (name) => setLayout(name),
+    onDataset: (dir) => switchDataset(dir),
     onGrid: (on) => setGrid(on),
     onLines: (on) => {
       state.lines = on;
@@ -73,6 +83,7 @@ async function main(): Promise<void> {
     onShowAll: (visible) => setHidden(allIds(), !visible),
   });
 
+  ui.setDatasets(datasets, DATA_DIR);
   if (!data || !data.items.length) {
     ui.showEmptyState();
     animateEmpty();
@@ -164,9 +175,11 @@ async function main(): Promise<void> {
     });
   }
 
-  const setMeta = () => ui.setMeta(`${n.toLocaleString()} images · ${data!.model.split('/').pop()} · ${data!.pooling} pool`);
+  const setMeta = () => ui.setMeta(`${n.toLocaleString()} images · ${modelLabel(data!, datasets)} · ${data!.pooling} pool`);
   setMeta();
   ui.setLayouts(Object.keys(data.layouts).filter((l) => l !== 'patch'), cloud.layout);
+  const wantedLayout = new URLSearchParams(location.search).get('layout');
+  if (wantedLayout && wantedLayout !== 'patch' && data.layouts[wantedLayout]) cloud.setLayout(data, wantedLayout, 0);
   ui.buildDrawer(categories, data.items, cloud.hidden);
   ui.setGrid(true);
   state.shown = n;
@@ -410,13 +423,18 @@ async function main(): Promise<void> {
   }
 
   // --------------------------------------------------------------- uploads
-  const SERVER_HINT = 'Start the embedding server: <code>python serve.py --data ./public/data</code>';
+  const SERVER_HINT = `Start the embedding server: <code>python serve.py --data ./public/${DATA_DIR}</code>`;
+  const api = (path: string, params: Record<string, string> = {}) =>
+    `/api/${path}?${new URLSearchParams({ data: DATA_DIR, ...params })}`;
 
-  async function serverStatus(): Promise<{ n: number; model: string } | null> {
+  async function serverStatus(): Promise<{ n: number; model: string; label?: string; datasets?: string[] } | null> {
     try {
-      const r = await fetch('/api/status', { cache: 'no-store' });
-      if (!r.ok) return null;
+      const r = await fetch(api('status'), { cache: 'no-store' });
       const j = await r.json();
+      if (!r.ok) {
+        if (Array.isArray(j.datasets)) return { n: -1, model: '', datasets: j.datasets };
+        return null;
+      }
       return j.ok ? j : null;
     } catch {
       return null;
@@ -425,9 +443,10 @@ async function main(): Promise<void> {
 
   async function refreshServerStatus(): Promise<boolean> {
     const s = await serverStatus();
-    if (s) ui.setUploadStatus(`Embedding server connected · ${s.model.split('/').pop()}`, 'ok');
+    if (s && s.n >= 0) ui.setUploadStatus(`Embedding server connected · ${s.label ?? s.model.split('/').pop()}`, 'ok');
+    else if (s) ui.setUploadStatus(`The embedding server is not serving <code>public/${DATA_DIR}</code>. Restart it with every folder: <code>python serve.py --data ./public/${[...new Set([...s.datasets!, DATA_DIR])].join(' ./public/')}</code>`, 'err');
     else ui.setUploadStatus(SERVER_HINT, 'err');
-    return !!s;
+    return !!s && s.n >= 0;
   }
 
   interface EmbedResponse {
@@ -498,7 +517,7 @@ async function main(): Promise<void> {
       ui.setLoading(done, files.length, 'Embedding');
       ui.setUploadStatus(`Embedding ${f.name} (${done + 1} of ${files.length})`, 'ok');
       try {
-        const url = `/api/embed?name=${encodeURIComponent(f.name)}&category=${encodeURIComponent(category)}`;
+        const url = api('embed', { name: f.name, category });
         const r = await fetch(url, { method: 'POST', body: f, headers: { 'Content-Type': f.type || 'application/octet-stream' } });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error ?? r.statusText);
@@ -513,7 +532,7 @@ async function main(): Promise<void> {
     }
     ui.setLoading(files.length, files.length, 'Embedding');
     try {
-      const j = await (await fetch('/api/flush', { method: 'POST' })).json();
+      const j = await (await fetch(api('flush'), { method: 'POST' })).json();
       if (j.similarity) {
         d.similarity = j.similarity;
         state.sim = await loadSimilarity(d);

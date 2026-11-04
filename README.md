@@ -43,7 +43,8 @@ Options:
 
 | flag | default | meaning |
 | --- | --- | --- |
-| `--model` | `facebook/ijepa_vith14_1k` | any I-JEPA checkpoint on the Hub (`facebook/ijepa_vith14_22k`, `facebook/ijepa_vitg16_22k`, ...) |
+| `--model` | `facebook/ijepa_vith14_1k` | any Hugging Face vision encoder: other I-JEPA checkpoints (`facebook/ijepa_vith14_22k`, `facebook/ijepa_vitg16_22k`), DINOv2, CLIP vision towers, or CNNs such as `microsoft/resnet-50` and ConvNeXt (see *Comparing encoders*) |
+| `--label` | from `--model` | the name shown in the viewer's encoder switch |
 | `--pool` | `mean` | how patch tokens are pooled into one vector per image (`mean` or `max`) |
 | `--umap` | off | also compute a UMAP layout (needs a few dozen images or more) |
 | `--batch-size` | 16 | inference batch size |
@@ -112,19 +113,30 @@ The image-level views place each picture at one point: its 256 patch tokens aver
 
 At 5,000 images this is 1.28 million points in one draw call, which still holds 60 fps.
 
-### Comparing data sets
+### Comparing encoders
 
-The viewer reads `public/data/` by default. Add `?data=<folder>` to the URL to read another folder under `public/`, for example `?data=synthetic`.
+Nothing in the viewer is specific to I-JEPA: it draws whatever vectors `embed.py` wrote. The interesting question is how the picture changes with the encoder, so you can embed the same folder with several models and switch between them in the header:
+
+```bash
+python embed.py --images ./images --out ./public/data   --label "I-JEPA ViT-H/14" --umap
+python embed.py --images ./images --out ./public/resnet --model microsoft/resnet-50 --label ResNet-50 --umap
+```
+
+Each run that writes directly under `public/` is registered in `public/datasets.json`, and the viewer shows a segmented switch next to the title when more than one run is listed. Switching reloads the page on that folder and keeps the current layout. Any Hugging Face vision model works: for ViTs the patch tokens are the token grid (a CLS token is dropped), for CNNs they are the cells of the final feature map, so a ResNet-50 shows a 7 x 7 grid of 2048-d "patches" and mean pooling is exactly its global average pool.
+
+What to expect: a supervised ImageNet CNN organizes images by the classes it was trained to separate, so photos of the same kind of object sit close together and everything else is pushed far apart. I-JEPA was trained to predict masked patch embeddings from context, so its features follow structure and texture more than category labels, and its 256 patch tokens carry far more within-image variety than a CNN's 49 pooled cells.
+
+The viewer reads `public/data/` by default; `?data=<folder>` selects any folder under `public/` directly, for example `?data=synthetic`.
 
 ## 3. Add your own images while the viewer is open
 
 Start the embedding server in a second terminal. It loads the encoder once and keeps it in memory.
 
 ```bash
-python serve.py --data ./public/data
+python serve.py --data ./public/data ./public/resnet
 ```
 
-Then click **Add images** in the viewer, or drop image files anywhere on the page. Each image is embedded (well under a second on a GPU or Apple Silicon), projected into the existing PCA, UMAP and patch layouts with the projections saved by `embed.py`, and added to the scene in place: it fades in, the camera flies to it, and its nearest neighbors appear in the panel. Give the batch a category in the popover to color the new points; otherwise they are gray.
+List every data folder you want to upload into; each encoder is loaded once and shared between folders that use the same model. Then click **Add images** in the viewer, or drop image files anywhere on the page. Each image is embedded (well under a second on a GPU or Apple Silicon), projected into the existing PCA, UMAP and patch layouts with the projections saved by `embed.py`, and added to the scene in place: it fades in, the camera flies to it, and its nearest neighbors appear in the panel. Give the batch a category in the popover to color the new points; otherwise they are gray.
 
 Uploads are permanent. The server writes the thumbnail, a preview copy, the embedding, the patch tokens and the updated `points.json` into the data folder, and refreshes `similarity.bin`, so the images are still there after a reload. Existing images' neighbor lists are updated when a new image is closer than their old neighbors.
 

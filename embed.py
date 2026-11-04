@@ -1,8 +1,13 @@
 #!/usr/bin/env python
-"""Embed a folder of images with a frozen I-JEPA encoder and write data for the explorer.
+"""Embed a folder of images with a frozen vision encoder and write data for the explorer.
 
 Usage:
     python embed.py --images ./images --out ./public/data [--umap] [--model facebook/ijepa_vith14_1k]
+    python embed.py --images ./images --out ./public/resnet --model microsoft/resnet-50 --label ResNet-50
+
+Any Hugging Face vision model whose last_hidden_state is a token grid works: ViTs such as
+I-JEPA, DINOv2 or CLIP (B, P, D), and CNNs such as ResNet or ConvNeXt (B, C, H, W). The viewer
+does not care which; the point of running several is to compare what each one learned.
 
 Outputs (in --out):
     points.json       3D layouts, items, nearest neighbors
@@ -13,6 +18,9 @@ Outputs (in --out):
     patches.bin       float32 (N, P, 3): every patch token projected into a shared 3D PCA space
     patch_feats.bin   float32 (N, P, K): the same tokens in K PCA dims, for patch-level matching
     models.pkl        the fitted PCA / UMAP projections, so serve.py can add images later
+
+When --out sits directly under public/, the run is also registered in public/datasets.json,
+which is what the viewer's model switch lists.
 """
 
 from __future__ import annotations
@@ -33,7 +41,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--images", required=True, type=Path, help="input folder (recursive; subfolder = category)")
     p.add_argument("--out", required=True, type=Path, help="output folder, e.g. ./public/data")
-    p.add_argument("--model", default="facebook/ijepa_vith14_1k", help="Hugging Face checkpoint name")
+    p.add_argument("--model", default="facebook/ijepa_vith14_1k", help="Hugging Face checkpoint name (ViT or CNN)")
+    p.add_argument("--label", default=None, help="name shown in the viewer's model switch (default: from --model)")
     p.add_argument("--pool", default="mean", choices=["mean", "max"], help="how to pool patch tokens")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--device", default=None, help="cuda | mps | cpu (auto-detected by default)")
@@ -77,42 +86,102 @@ def load_rgb(path: Path) -> Image.Image:
     return img.convert("RGB")
 
 
+def default_label(model_name: str) -> str:
+    return model_name.split("/")[-1]
+
+
+class Backbone:
+    """A frozen Hugging Face vision encoder, reduced to one interface: a grid of spatial tokens per image.
+
+    ViT-style models return last_hidden_state as (B, P, D); a leading CLS token is dropped when the
+    remaining count is square. CNNs return a feature map (B, C, H, W), which is flattened to (B, H*W, C),
+    so a ResNet-50 yields a 7 x 7 grid of 2048-d "patches". Mean pooling the grid is then exactly the
+    global average pool a classifier would see.
+    """
+
+    def __init__(self, model_name: str, device):
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
+
+        self.torch = torch
+        self.name = model_name
+        self.device = device
+        print(f"loading {model_name} on {device} ...", flush=True)
+        self.proc = AutoImageProcessor.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).eval().to(device)
+        for param in self.model.parameters():  # frozen encoder
+            param.requires_grad_(False)
+        self.grid: tuple[int, int] | None = None
+        self.kind = "unknown"
+
+    def tokens(self, images: list[Image.Image]):
+        """(B, P, D) spatial tokens for a batch of PIL images. Sets self.grid on first use."""
+        inputs = self.proc(images=images, return_tensors="pt").to(self.device)
+        h = self.model(**inputs).last_hidden_state
+        if h.dim() == 4:  # CNN feature map
+            _, _, hh, ww = h.shape
+            self.grid, self.kind = (int(hh), int(ww)), "cnn"
+            return h.flatten(2).transpose(1, 2)
+        p = int(h.shape[1])
+        side = int(round(p**0.5))
+        if side * side == p:
+            self.grid = (side, side)
+        elif int(round((p - 1) ** 0.5)) ** 2 == p - 1:
+            h = h[:, 1:]  # CLS token first, then a square grid
+            side = int(round((p - 1) ** 0.5))
+            self.grid = (side, side)
+        else:
+            self.grid = (1, p)
+        self.kind = "vit"
+        return h
+
+    def embed(self, images: list[Image.Image], pool: str):
+        """Returns (L2-normalized pooled embeddings (B, D), tokens (B, P, D)) as torch tensors."""
+        with self.torch.no_grad():
+            tokens = self.tokens(images)
+            emb = tokens.mean(dim=1) if pool == "mean" else tokens.max(dim=1).values
+            emb = self.torch.nn.functional.normalize(emb, dim=-1)
+        return emb, tokens
+
+
 def embed_images(
-    paths: list[Path], model_name: str, pool: str, batch_size: int, device, token_store: Path | None
+    paths: list[Path], backbone: Backbone, pool: str, batch_size: int, token_store: Path | None
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Returns (image embeddings (N, D), patch tokens memmap (N, P, D) float16 or None)."""
-    import torch
     from tqdm import tqdm
-    from transformers import AutoImageProcessor, AutoModel
-
-    print(f"loading {model_name} on {device} ...", flush=True)
-    proc = AutoImageProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).eval().to(device)
-    for param in model.parameters():  # frozen encoder
-        param.requires_grad_(False)
 
     chunks: list[np.ndarray] = []
     tokens_mm: np.ndarray | None = None
-    with torch.no_grad():
-        for start in tqdm(range(0, len(paths), batch_size), desc="embedding", unit="batch"):
-            batch = [load_rgb(p) for p in paths[start : start + batch_size]]
-            inputs = proc(images=batch, return_tensors="pt").to(device)
-            out = model(**inputs)
-            tokens = out.last_hidden_state  # (B, num_patches, D); I-JEPA has no CLS token
-            if token_store is not None:
-                if tokens_mm is None:
-                    shape = (len(paths), int(tokens.shape[1]), int(tokens.shape[2]))
-                    tokens_mm = np.lib.format.open_memmap(token_store, mode="w+", dtype=np.float16, shape=shape)
-                tokens_mm[start : start + tokens.shape[0]] = tokens.float().cpu().numpy().astype(np.float16)
-            if pool == "mean":
-                emb = tokens.mean(dim=1)
-            else:
-                emb = tokens.max(dim=1).values
-            emb = torch.nn.functional.normalize(emb, dim=-1)
-            chunks.append(emb.float().cpu().numpy())
+    for start in tqdm(range(0, len(paths), batch_size), desc="embedding", unit="batch"):
+        batch = [load_rgb(p) for p in paths[start : start + batch_size]]
+        emb, tokens = backbone.embed(batch, pool)
+        if token_store is not None:
+            if tokens_mm is None:
+                shape = (len(paths), int(tokens.shape[1]), int(tokens.shape[2]))
+                tokens_mm = np.lib.format.open_memmap(token_store, mode="w+", dtype=np.float16, shape=shape)
+            tokens_mm[start : start + tokens.shape[0]] = tokens.float().cpu().numpy().astype(np.float16)
+        chunks.append(emb.float().cpu().numpy())
     if tokens_mm is not None:
         tokens_mm.flush()
     return np.concatenate(chunks, axis=0), tokens_mm
+
+
+def register_dataset(out: Path, label: str, model: str) -> None:
+    """Add this run to public/datasets.json (the viewer's model switch) when --out is a child of public/."""
+    registry = out.parent / "datasets.json"
+    if out.parent.name != "public" and not registry.exists():
+        return
+    entries: list[dict] = []
+    if registry.exists():
+        try:
+            entries = [e for e in json.load(open(registry)) if isinstance(e, dict) and e.get("dir") != out.name]
+        except (OSError, ValueError):
+            entries = []
+    entries.append({"dir": out.name, "label": label, "model": model})
+    entries.sort(key=lambda e: (e["dir"] != "data", e["dir"]))  # the default folder stays first
+    with open(registry, "w") as f:
+        json.dump(entries, f, indent=2)
+    print(f"registered '{label}' in {registry}")
 
 
 def cube_transform(xyz: np.ndarray, extent: float) -> tuple[np.ndarray, float]:
@@ -259,8 +328,10 @@ def main() -> None:
     device = pick_device(args.device)
     args.out.mkdir(parents=True, exist_ok=True)
     token_store = None if args.no_patches else args.out / "_tokens.npy"
-    E, tokens = embed_images(paths, args.model, args.pool, args.batch_size, device, token_store)
-    print(f"embeddings: {E.shape}")
+    backbone = Backbone(args.model, device)
+    E, tokens = embed_images(paths, backbone, args.pool, args.batch_size, token_store)
+    print(f"embeddings: {E.shape}  ({backbone.kind}, token grid {backbone.grid})")
+    label = args.label or default_label(args.model)
     np.save(args.out / "embeddings.npy", E)
 
     sim = (E @ E.T).astype(np.float32)
@@ -275,8 +346,7 @@ def main() -> None:
         fits.update(patch_fits)
         layouts["patch"] = centroids.round(4).tolist()
         xyz.tofile(args.out / "patches.bin")
-        side = int(round(tokens.shape[1] ** 0.5))
-        patch_info = {"file": "patches.bin", "count": int(tokens.shape[1]), "grid": [side, side]}
+        patch_info = {"file": "patches.bin", "count": int(tokens.shape[1]), "grid": list(backbone.grid or (1, tokens.shape[1]))}
         if len(paths) <= args.patch_feats_max:
             feats.tofile(args.out / "patch_feats.bin")
             patch_info["feats"] = "patch_feats.bin"
@@ -298,6 +368,7 @@ def main() -> None:
     ]
     data = {
         "model": args.model,
+        "label": label,
         "pooling": args.pool,
         "dim": int(E.shape[1]),
         "layouts": layouts,
@@ -315,12 +386,13 @@ def main() -> None:
 
     import pickle
 
-    fits.update({"model": args.model, "pool": args.pool, "extent": args.extent, "neighbors": args.neighbors,
+    fits.update({"model": args.model, "label": label, "pool": args.pool, "extent": args.extent, "neighbors": args.neighbors,
                  "sim_max": args.sim_max, "patch_feats_max": args.patch_feats_max,
                  "thumb_size": args.thumb_size, "image_size": args.image_size})
     with open(args.out / "models.pkl", "wb") as f:
         pickle.dump(fits, f)
 
+    register_dataset(args.out.resolve(), label, args.model)
     print_similarity_report(sim, categories, [p.name for p in paths])
     print(f"\nwrote {args.out / 'points.json'} in {time.time() - t0:.1f}s")
 

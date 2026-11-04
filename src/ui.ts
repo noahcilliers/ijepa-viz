@@ -1,10 +1,12 @@
-import { DATA_BASE, LAYOUT_LABELS, type Category, type Item, type Neighbor } from './data';
+import { DATA_BASE, LAYOUT_LABELS, type Category, type Dataset, type Item, type Neighbor } from './data';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
 export interface UICallbacks {
   onSearch(query: string): void;
   onLayout(name: string): void;
+  /** Switch to another embedding run (another encoder). */
+  onDataset(dir: string): void;
   onGrid(on: boolean): void;
   onLines(on: boolean): void;
   onThumbnails(on: boolean): void;
@@ -181,6 +183,23 @@ export class UI {
 
   setMeta(text: string): void {
     $('meta').textContent = text;
+  }
+
+  /** The encoder switch next to the title; hidden unless more than one run is registered. */
+  setDatasets(list: Dataset[], activeDir: string): void {
+    const el = $('model-toggle');
+    el.innerHTML = '';
+    el.hidden = list.length < 2;
+    for (const d of list) {
+      const b = document.createElement('button');
+      b.textContent = d.label || d.dir;
+      b.title = d.model ? `${d.model} · public/${d.dir}` : `public/${d.dir}`;
+      b.classList.toggle('active', d.dir === activeDir);
+      b.addEventListener('click', () => {
+        if (d.dir !== activeDir) this.cb.onDataset(d.dir);
+      });
+      el.appendChild(b);
+    }
   }
 
   setLayouts(names: string[], active: string): void {

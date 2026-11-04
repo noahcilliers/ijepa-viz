@@ -23,6 +23,7 @@ export interface PatchInfo {
 
 export interface PointsData {
   model: string;
+  label?: string;
   pooling: string;
   dim?: number;
   layouts: Record<string, number[][]>;
@@ -34,8 +35,32 @@ export interface PointsData {
 
 export const LAYOUT_LABELS: Record<string, string> = { pca: 'PCA', umap: 'UMAP', patch: 'Patches' };
 
-/** Data folder under public/, switchable with ?data=<folder> for comparing runs. */
-export const DATA_BASE = (new URLSearchParams(location.search).get('data') ?? 'data').replace(/\/+$/, '') + '/';
+/** Data folder under public/, switchable with ?data=<folder> for comparing runs (one per encoder). */
+export const DATA_DIR = (new URLSearchParams(location.search).get('data') ?? 'data').replace(/\/+$/, '');
+export const DATA_BASE = DATA_DIR + '/';
+
+/** One embedding run registered in public/datasets.json (embed.py writes it). */
+export interface Dataset {
+  dir: string;
+  label: string;
+  model?: string;
+}
+
+export async function loadDatasets(): Promise<Dataset[]> {
+  try {
+    const res = await fetch('datasets.json', { cache: 'no-cache' });
+    if (!res.ok) return [];
+    const list = (await res.json()) as Dataset[];
+    return Array.isArray(list) ? list.filter((d) => d && typeof d.dir === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Short display name for a run. */
+export function modelLabel(data: PointsData, datasets: Dataset[]): string {
+  return datasets.find((d) => d.dir === DATA_DIR)?.label ?? data.label ?? data.model.split('/').pop() ?? data.model;
+}
 
 export async function loadPoints(): Promise<PointsData | null> {
   const res = await fetch(`${DATA_BASE}points.json`, { cache: 'no-cache' });
